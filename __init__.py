@@ -1,6 +1,10 @@
+import math
 import torch
 import types
 import comfy.conds
+import comfy.utils
+import node_helpers
+from comfy_api.latest import io
 
 class ApplyCosmosReferenceModelPatch:
     @classmethod
@@ -16,7 +20,9 @@ class ApplyCosmosReferenceModelPatch:
     CATEGORY = "Cosmos/Reference"
 
     def patch(self, model):
-        m = model.clone() 
+        m = model.clone()
+        if m.model_options.get("cosmos_reference_patch", False):
+            return (m,)
         
         # 1. 拦截 extra_conds 以便从 Conditioning 中提取参考图
         original_extra_conds = m.model.extra_conds
@@ -42,6 +48,7 @@ class ApplyCosmosReferenceModelPatch:
         prev_wrapper = m.model_options.get("model_function_wrapper", None)
 
         def ref_latent_unet_wrapper(model_apply, model_kwargs):
+            model_kwargs = model_kwargs.copy()
             c_dict = model_kwargs.get("c", {})
             
             # --- 收集参考图 ---
@@ -110,6 +117,7 @@ class ApplyCosmosReferenceModelPatch:
                     return model_apply(x_val, t_val, **cond_dict, **mk)
 
         m.set_model_unet_function_wrapper(ref_latent_unet_wrapper)
+        m.model_options["cosmos_reference_patch"] = True
 
         return (m,)
 
@@ -153,12 +161,76 @@ class ApplyCosmosReferenceLatent:
         
         return (m,)
 
+
+class CosmosReferenceImagesEncode(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="CosmosReferenceImagesEncode",
+            display_name="Cosmos Reference Images Encode",
+            category="Cosmos/Reference",
+            description="Encode ordered reference images for Cosmos and attach them to positive and negative conditioning.",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae"),
+                io.Float.Input("megapixels", default=1.0, min=0.01, max=16.0, step=0.01),
+                io.Autogrow.Input(
+                    "images",
+                    template=io.Autogrow.TemplateNames(
+                        io.Image.Input("image"),
+                        names=[f"image_{i}" for i in range(100)],
+                        min=1,
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Conditioning.Output(id="positive", display_name="positive"),
+                io.Conditioning.Output(id="negative", display_name="negative"),
+                io.Latent.Output(id="latent", display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, vae, megapixels=1.0, images=None):
+        ordered = [image for _, image in sorted(
+            (images or {}).items(), key=lambda item: int(item[0].rsplit("_", 1)[-1])
+        ) if image is not None]
+        if not ordered:
+            raise ValueError("Connect at least one reference image.")
+
+        first = ordered[0]
+        if first.shape[0] != 1:
+            raise ValueError("Each reference image must have batch size 1.")
+        h, w = first.shape[1:3]
+        scale = math.sqrt(megapixels * 1024 * 1024 / (h * w))
+        width = max(16, round(w * scale / 16) * 16)
+        height = max(16, round(h * scale / 16) * 16)
+
+        reference_latents = []
+        for index, image in enumerate(ordered):
+            if image.shape[0] != 1:
+                raise ValueError(f"Reference image {index + 1} must have batch size 1.")
+            pixels = image.movedim(-1, 1)
+            ih, iw = pixels.shape[-2:]
+            if (ih, iw) != (height, width):
+                crop = "disabled" if index == 0 else "center"
+                pixels = comfy.utils.common_upscale(pixels, width, height, "lanczos", crop)
+            reference_latents.append(vae.encode(pixels[:, :3].movedim(1, -1)))
+
+        ref_values = {"reference_latents": reference_latents}
+        positive = node_helpers.conditioning_set_values(positive, ref_values)
+        negative = node_helpers.conditioning_set_values(negative, ref_values)
+        return io.NodeOutput(positive, negative, {"samples": reference_latents[0]})
+
 NODE_CLASS_MAPPINGS = {
     "ApplyCosmosReferenceModelPatch": ApplyCosmosReferenceModelPatch,
-    "ApplyCosmosReferenceLatent": ApplyCosmosReferenceLatent
+    "ApplyCosmosReferenceLatent": ApplyCosmosReferenceLatent,
+    "CosmosReferenceImagesEncode": CosmosReferenceImagesEncode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ApplyCosmosReferenceModelPatch": "Apply Cosmos Reference Model Patch",
-    "ApplyCosmosReferenceLatent": "Apply Cosmos Reference Latent"
+    "ApplyCosmosReferenceLatent": "Apply Cosmos Reference Latent",
+    "CosmosReferenceImagesEncode": "Cosmos Reference Images Encode"
 }
